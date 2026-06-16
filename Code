@@ -1,0 +1,861 @@
+/*
+  * ============================================================
+  *  EMRC-IDS — Integrated IDS with ILI9341 TFT Display
+ *  Hardware : ESP32 DevKit V1 38-pin
+ *  Modules  : MCP2515 + NRF24 + CC1101 + ILI9341 TFT
+ *
+ *  LIBRARIES NEEDED (install via Library Manager):
+ *  → MCP_CAN              by coryjfowler
+ *  → RF24                 by TMRh20
+ *  → ELECHOUSE_CC1101_SRC_DRV by LSatan
+ *  → Adafruit ILI9341     by Adafruit
+ *  → Adafruit GFX Library by Adafruit
+ *
+ *  PIN CONNECTIONS:
+ *  ─────────────────────────────────────────
+ *  SHARED SPI:
+ *  MOSI → GPIO 23
+ *  MISO → GPIO 19
+ *  SCK  → GPIO 18
+ *
+ *  MCP2515:          NRF24 (adapter):
+ *  CS   → GPIO 5     VCC  → 5V
+ *  INT  → GPIO 35    CE   → GPIO 4
+ *                    CSN  → GPIO 17
+ *  CC1101:
+ *  CS   → GPIO 16
+ *
+ *  ILI9341 TFT:
+ *  VCC  → 3.3V
+ *  GND  → GND
+ *  CS   → GPIO 15
+ *  DC   → GPIO 2
+ *  RST  → GPIO 27
+ *  SDI  → GPIO 23  (MOSI shared)
+ *  SCK  → GPIO 18  (SCK shared)
+ *  LED  → 3.3V
+ *  SDO  → GPIO 19  (MISO shared)
+ * ============================================================
+ */
+
+#include <SPI.h>
+#include <mcp_can.h>
+#include <RF24.h>
+#include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <WiFi.h> 
+
+
+// ─── PIN CONFIG ──────────────────────────────
+#define MCP_CS      5
+#define MCP_INT     35
+#define NRF_CE      4
+#define NRF_CS      17
+#define CC1101_CS   16
+
+// TFT pins
+#define TFT_CS      15
+#define TFT_DC      25
+#define TFT_RST     27
+
+MCP_CAN CAN(MCP_CS);
+RF24 radio(NRF_CE, NRF_CS);
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+// ─── COLOURS ─────────────────────────────────
+#define CLR_BG          ILI9341_BLACK
+#define CLR_TITLE        0x04BF   // dark teal
+#define CLR_WHITE        ILI9341_WHITE
+#define CLR_GREEN        ILI9341_GREEN
+#define CLR_YELLOW       ILI9341_YELLOW
+#define CLR_RED          ILI9341_RED
+#define CLR_ORANGE       0xFD20   // orange
+#define CLR_GREY         0x7BEF   // light grey
+#define CLR_DARKGREY     0x4208   // dark grey
+#define CLR_CYAN         ILI9341_CYAN
+#define CLR_BAR_BG       0x2104   // dark bar background
+
+// ─── CAN IDS ─────────────────────────────────
+#define MAX_IDS 50
+unsigned long learnedIDs[MAX_IDS];
+int idCount = 0;
+bool learning_mode       = true;
+unsigned long learning_start      = 0;
+const unsigned long LEARNING_TIME = 30000;
+
+int can_score = 0;
+
+unsigned long flood_count        = 0;
+unsigned long flood_window_start = 0;
+
+byte last_data[8];
+bool has_last_data = false;
+
+// ─── RF SCORES ───────────────────────────────
+int rf_score_24  = 0;
+int rf_score_sub = 0;
+int nrf_baseline_count = 0;    // noise floor channel count
+int nrf_cumulative = 0;
+unsigned long nrf_window_start = 0;
+
+#define NRF_CHANNEL_THRESHOLD  3
+
+// ─── CC1101 ──────────────────────────────────
+float cc1101_bands[] = {315.0, 433.0, 868.0, 915.0};
+#define NUM_BANDS 4
+int cc1101_noise_floor = -40;
+
+WiFiServer testServer(80);
+unsigned long last_wifi_ping = 0;
+
+// ─── THREAT ──────────────────────────────────
+float threat_score = 0;
+
+// ─── TIMERS ──────────────────────────────────
+unsigned long last_serial_print = 0;
+unsigned long last_tft_update   = 0;
+unsigned long last_decay        = 0;
+
+// ─── LAST ALERT MESSAGE ──────────────────────
+char last_alert[40] = "None";
+
+// ─── TFT UPDATE FLAG ─────────────────────────
+// only redraw bars when scores actually change
+int prev_rf24  = -1;
+int prev_sub   = -1;
+int prev_can   = -1;
+float prev_threat = -1;
+bool prev_learning = true;
+
+// =============================================
+// FORWARD DECLARATIONS
+// =============================================
+void calibrateCC1101();
+void drawStaticUI();
+void updateDashboard();
+void drawBar(int x, int y, int w, int h, int value, int maxVal, uint16_t colour);
+void drawThreatBadge(float score);
+void setAlert(const char* msg);
+const char* getThreatLevel();
+
+// =============================================
+// CC1101 CALIBRATION
+// =============================================
+void calibrateCC1101() {
+  Serial.println("Calibrating CC1101...");
+
+  SPI.begin();  // ← explicit SPI for CC1101
+  ELECHOUSE_cc1101.SetRx();
+
+  int worst_rssi = -120;
+  for (int i = 0; i < NUM_BANDS; i++) {
+    yield();
+    ELECHOUSE_cc1101.setMHZ(cc1101_bands[i]);
+    delay(10);
+    for (int j = 0; j < 5; j++) {
+      int rssi = ELECHOUSE_cc1101.getRssi();
+      Serial.printf("  %.0f MHz sample %d: %d dBm\n",
+                    cc1101_bands[i], j, rssi);  // ← debug each sample
+      if (rssi > worst_rssi) worst_rssi = rssi;
+      delay(5);
+    }
+  }
+
+  cc1101_noise_floor = worst_rssi - 5;
+  Serial.printf("CC1101 noise floor : %d dBm\n", worst_rssi);
+  Serial.printf("CC1101 threshold   : %d dBm\n", cc1101_noise_floor);
+
+  SPI.end();
+  delay(20);
+ SPI.begin(); 
+  delay(20);
+}
+
+// =============================================
+// TFT — DRAW STATIC UI FRAME
+// Only called once on boot — draws all labels
+// =============================================
+void drawStaticUI() {
+  tft.fillScreen(CLR_BG);
+
+  // ── Title bar ──────────────────────────────
+  tft.fillRect(0, 0, 320, 36, CLR_TITLE);
+  tft.setTextColor(CLR_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(8, 10);
+  tft.print("EMRC-IDS");
+  tft.setTextSize(1);
+  tft.setCursor(170, 14);
+  tft.setTextColor(CLR_CYAN);
+  tft.print("Multi-Band IDS v1.0");
+
+  // ── Section labels ─────────────────────────
+  tft.setTextSize(1);
+  tft.setTextColor(CLR_GREY);
+
+  // RF 2.4G row  y=55
+  tft.setCursor(8, 50);
+  tft.setTextColor(CLR_CYAN);
+  tft.print("RF 2.4G");
+  tft.setTextColor(CLR_GREY);
+  tft.setCursor(8, 62);
+  tft.print("NRF24L01");
+
+  // RF SubGHz row y=105
+  tft.setCursor(8, 100);
+  tft.setTextColor(CLR_CYAN);
+  tft.print("RF SubGHz");
+  tft.setTextColor(CLR_GREY);
+  tft.setCursor(8, 112);
+  tft.print("CC1101");
+
+  // CAN Bus row y=155
+  tft.setCursor(8, 150);
+  tft.setTextColor(CLR_CYAN);
+  tft.print("CAN Bus");
+  tft.setTextColor(CLR_GREY);
+  tft.setCursor(8, 162);
+  tft.print("MCP2515");
+
+  // Divider line
+  tft.drawFastHLine(0, 195, 320, CLR_DARKGREY);
+
+  // Threat level label
+  tft.setCursor(8, 202);
+  tft.setTextColor(CLR_GREY);
+  tft.print("THREAT LEVEL");
+
+  // Last alert label
+  tft.setCursor(8, 222);
+  tft.setTextColor(CLR_GREY);
+  tft.print("LAST ALERT:");
+}
+
+// =============================================
+// TFT — DRAW A SCORE BAR
+// x,y = top-left of bar area
+// w,h = bar dimensions
+// value = current score (0-10)
+// =============================================
+void drawBar(int x, int y, int w, int h,
+             int value, int maxVal, uint16_t colour) {
+  // Background
+  tft.fillRect(x, y, w, h, CLR_BAR_BG);
+
+  // Filled portion
+  int filled = map(value, 0, maxVal, 0, w);
+  filled = constrain(filled, 0, w);
+  if (filled > 0) {
+    tft.fillRect(x, y, filled, h, colour);
+  }
+
+  // Border
+  tft.drawRect(x, y, w, h, CLR_GREY);
+}
+
+// =============================================
+// TFT — DRAW THREAT BADGE (colour coded)
+// =============================================
+void drawThreatBadge(float score) {
+  uint16_t colour;
+  const char* label;
+
+  if (score <= 3) {
+    colour = CLR_GREEN;
+    label  = "  LOW   ";
+  } else if (score <= 6) {
+    colour = CLR_YELLOW;
+    label  = " MEDIUM ";
+  } else {
+    colour = CLR_RED;
+    label  = "  HIGH  ";
+  }
+
+  // Badge background
+  tft.fillRoundRect(100, 195, 120, 22, 4, colour);
+  tft.setTextColor(CLR_BG);
+  tft.setTextSize(2);
+  tft.setCursor(108, 200);
+  tft.print(label);
+  tft.setTextSize(1);
+}
+
+// =============================================
+// TFT — SET ALERT MESSAGE
+// =============================================
+void setAlert(const char* msg) {
+  strncpy(last_alert, msg, 39);
+
+  // Clear alert area and reprint
+  tft.fillRect(70, 220, 250, 10, CLR_BG);
+  tft.setTextColor(CLR_ORANGE);
+  tft.setTextSize(1);
+  tft.setCursor(70, 222);
+  tft.print(last_alert);
+}
+
+// =============================================
+// TFT — UPDATE DYNAMIC PARTS OF DASHBOARD
+// Only redraws what has changed
+// =============================================
+void updateDashboard() {
+
+  bool changed = (rf_score_24  != prev_rf24)
+              || (rf_score_sub != prev_sub)
+              || (can_score    != prev_can)
+              || (threat_score != prev_threat)
+              || (learning_mode != prev_learning);
+
+  if (!changed) return;  // nothing to redraw
+
+  // ── Mode indicator (top right) ─────────────
+  tft.fillRect(230, 38, 90, 12, CLR_BG);
+  tft.setTextSize(1);
+  if (learning_mode) {
+    tft.setTextColor(CLR_YELLOW);
+    tft.setCursor(232, 40);
+    tft.print("LEARNING...");
+  } else {
+    tft.setTextColor(CLR_GREEN);
+    tft.setCursor(232, 40);
+    tft.print("MONITORING");
+  }
+
+  // ── RF 2.4G bar ────────────────────────────
+  // Score text
+  tft.fillRect(70, 50, 50, 20, CLR_BG);
+  tft.setTextColor(CLR_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(70, 52);
+  tft.print(rf_score_24);
+  tft.setTextSize(1);
+  tft.setTextColor(CLR_GREY);
+  tft.print("/10");
+
+  // Bar — colour changes with score
+  uint16_t c24 = (rf_score_24 <= 3) ? CLR_GREEN :
+                 (rf_score_24 <= 6) ? CLR_YELLOW : CLR_RED;
+  drawBar(140, 52, 160, 16, rf_score_24, 10, c24);
+
+  // ── RF SubGHz bar ───────────────────────────
+  tft.fillRect(70, 100, 50, 20, CLR_BG);
+  tft.setTextColor(CLR_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(70, 102);
+  tft.print(rf_score_sub);
+  tft.setTextSize(1);
+  tft.setTextColor(CLR_GREY);
+  tft.print("/10");
+
+  uint16_t csub = (rf_score_sub <= 3) ? CLR_GREEN :
+                  (rf_score_sub <= 6) ? CLR_YELLOW : CLR_RED;
+  drawBar(140, 102, 160, 16, rf_score_sub, 10, csub);
+
+  // ── CAN Bus bar ─────────────────────────────
+  tft.fillRect(70, 150, 50, 20, CLR_BG);
+  tft.setTextColor(CLR_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(70, 152);
+  tft.print(can_score);
+  tft.setTextSize(1);
+  tft.setTextColor(CLR_GREY);
+  tft.print("/10");
+
+  uint16_t ccan = (can_score <= 3) ? CLR_GREEN :
+                  (can_score <= 6) ? CLR_YELLOW : CLR_RED;
+  drawBar(140, 152, 160, 16, can_score, 10, ccan);
+
+// ── Threat score number ─────────────────────
+  tft.fillRect(0, 195, 320, 45, CLR_BG);  // clear entire bottom section
+
+  // Threat label
+  tft.setTextColor(CLR_GREY);
+  tft.setTextSize(1);
+  tft.setCursor(8, 200);
+  tft.print("THREAT:");
+
+  // Score number
+  tft.setTextColor(CLR_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(8, 212);
+  tft.printf("Score: %.1f/10", threat_score);
+
+  // Threat badge
+  drawThreatBadge(threat_score);
+
+  // Last alert
+  tft.setTextColor(CLR_GREY);
+  tft.setTextSize(1);
+  tft.setCursor(8, 228);
+  tft.print("ALERT:");
+  tft.setTextColor(CLR_ORANGE);
+  tft.setCursor(50, 228);
+  tft.print(last_alert);
+}
+
+// =============================================
+// TFT — BOOT SPLASH SCREEN
+// =============================================
+void drawBootScreen() {
+  tft.fillScreen(CLR_BG);
+
+  tft.setTextColor(CLR_CYAN);
+  tft.setTextSize(3);
+  tft.setCursor(30, 60);
+  tft.print("EMRC-IDS");
+
+  tft.setTextColor(CLR_GREY);
+  tft.setTextSize(1);
+  tft.setCursor(20, 100);
+  tft.print("Embedded Multi-Band RF &");
+  tft.setCursor(20, 114);
+  tft.print("CAN Intrusion Detection");
+
+  tft.setTextColor(CLR_WHITE);
+  tft.setCursor(20, 140);
+  tft.print("Initialising modules...");
+
+  //delay(1500);
+}
+
+// =============================================
+// TFT — SHOW MODULE INIT STATUS ON SCREEN
+// =============================================
+void drawInitStatus(const char* module, bool ok) {
+  static int init_y = 160;
+
+  tft.setTextSize(1);
+  tft.setCursor(20, init_y);
+  tft.setTextColor(CLR_WHITE);
+  tft.print(module);
+  tft.print(" ...... ");
+  if (ok) {
+    tft.setTextColor(CLR_GREEN);
+    tft.print("OK");
+  } else {
+    tft.setTextColor(CLR_RED);
+    tft.print("FAILED");
+  }
+  init_y += 14;
+}
+
+
+
+
+// =============================================
+// SETUP
+// =============================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  SPI.begin();
+
+  // ── TFT first ──────────────────────────────
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(CLR_BG);
+  tft.setTextColor(CLR_CYAN);
+  tft.setTextSize(3);
+  tft.setCursor(30, 80);
+  tft.print("EMRC-IDS");
+  tft.setTextColor(CLR_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(20, 130);
+  tft.print("Please wait...");
+
+  // ── All sensor inits — NO TFT CALLS HERE ───
+  pinMode(MCP_INT, INPUT_PULLUP);
+  bool mcp_ok = (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK);
+  if (mcp_ok) {
+    CAN.setMode(MCP_NORMAL);
+    Serial.println("MCP2515 OK");
+  } else {
+    Serial.println("MCP2515 FAILED");
+    while (1);
+  }
+  Serial.println("Testing NRF24...");
+delay(100);   
+
+  int nrf_attempts = 0;
+  bool nrf_ok = false;
+  while (!radio.begin()) {
+    nrf_attempts++;
+    Serial.printf("NRF24 attempt %d...\n", nrf_attempts);
+    delay(500);
+    if (nrf_attempts >= 5) break;
+  }
+  nrf_ok = (nrf_attempts < 5);
+  if (nrf_ok) {
+    radio.setAutoAck(false);
+    radio.startListening();
+    Serial.println("NRF24 OK");
+     
+  } else {
+    Serial.println("NRF24 FAILED");
+  }
+  WiFi.mode(WIFI_AP);
+WiFi.softAP("EMRC-TEST", "", 6);  // channel 6 = NRF24 ch 26
+testServer.begin();
+Serial.println("Test server started");
+
+  ELECHOUSE_cc1101.setSpiPin(18, 19, 23, CC1101_CS);
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.SetRx();
+  Serial.println("CC1101 OK");
+  calibrateCC1101();
+   Serial.println("Calibration done");
+
+   // ── Reinitialise SPI after CC1101 ──────────
+  SPI.end();                    // ← release SPI
+  delay(100);
+  SPI.begin(18, 19, 23, -1);   // ← restart SPI with correct pins
+  delay(100);
+  Serial.println("SPI reinit done");
+
+  // ── Now safe to draw on TFT ────────────────
+  Serial.println("Starting TFT draw...");
+  tft.begin();                  // ← reinit TFT after SPI restart
+  tft.setRotation(1);
+  tft.fillScreen(CLR_BG);
+  Serial.println("fillScreen done");
+
+  // ── ALL INITS DONE — now safe to draw ──────
+  // Show init results on TFT after all SPI inits complete
+  tft.fillScreen(CLR_BG);
+  tft.setTextColor(CLR_CYAN);
+  tft.setTextSize(2);
+  tft.setCursor(60, 20);
+  tft.print("EMRC-IDS");
+
+  tft.setTextSize(1);
+  int y = 60;
+
+  tft.setCursor(20, y); y += 16;
+  tft.setTextColor(mcp_ok ? CLR_GREEN : CLR_RED);
+  tft.print("MCP2515  : ");
+  tft.print(mcp_ok ? "OK" : "FAILED");
+
+  tft.setCursor(20, y); y += 16;
+  tft.setTextColor(nrf_ok ? CLR_GREEN : CLR_RED);
+  tft.print("NRF24    : ");
+  tft.print(nrf_ok ? "OK" : "FAILED");
+
+  tft.setCursor(20, y); y += 16;
+  tft.setTextColor(CLR_GREEN);
+  tft.print("CC1101   : OK");
+
+  tft.setCursor(20, y); y += 16;
+  tft.setTextColor(CLR_YELLOW);
+  tft.printf("Threshold: %d dBm", cc1101_noise_floor);
+
+  tft.setCursor(20, y + 10);
+  tft.setTextColor(CLR_WHITE);
+  tft.print("Starting in 2 seconds...");
+
+  delay(2000);  // safe here — all SPI inits complete
+
+  // ── Draw main dashboard ─────────────────────
+  drawStaticUI();
+  setAlert("System started");
+
+  // ── Timers ─────────────────────────────────
+  learning_start     = millis();
+  flood_window_start = millis();
+  last_decay         = millis();
+  last_serial_print  = millis();
+  last_tft_update    = millis();
+
+  Serial.println("=== EMRC-IDS STARTED ===\n");
+}
+
+
+// =============================================
+// LOOP
+// =============================================
+void loop() {
+  handleCAN();
+  handleNRF();
+  handleCC1101();
+  handleSerialCommands();
+  decayScores();
+  calculateThreat();
+  
+
+  // Update TFT every 500ms
+  if (millis() - last_tft_update > 500) {
+    updateDashboard();
+    last_tft_update = millis();
+  }
+
+  printStatus();
+}
+
+// =============================================
+// CAN HANDLER
+// =============================================
+void handleCAN() {
+
+  // ── TIMEOUT CHECK — MUST BE OUTSIDE INT CHECK ──
+  if (learning_mode && millis() - learning_start > LEARNING_TIME) {
+    learning_mode = false;
+    Serial.printf("Learning done — %d IDs learned\n", idCount);
+    setAlert("Detection active");
+  }
+
+  // ── FRAME READING ───────────────────────────────
+  if (!digitalRead(MCP_INT)) {
+    unsigned long id;
+    byte ext, len;
+    byte buf[8];
+    CAN.readMsgBuf(&id, &ext, &len, buf);
+
+    flood_count++;
+    unsigned long flood_elapsed = millis() - flood_window_start;
+    if (flood_elapsed >= 1000) {
+      float fps = (float)flood_count / (flood_elapsed / 1000.0);
+      if (fps > 200 && !learning_mode) {
+        char msg[32];
+        snprintf(msg, sizeof(msg), "CAN Flood %.0f fps", fps);
+        setAlert(msg);
+        can_score = min(10, can_score + 4);
+      }
+      flood_count = 0;
+      flood_window_start = millis();
+    }
+
+    if (learning_mode) {
+      bool exists = false;
+      for (int i = 0; i < idCount; i++) {
+        if (learnedIDs[i] == id) { exists = true; break; }
+      }
+      if (!exists && idCount < MAX_IDS) {
+        learnedIDs[idCount++] = id;
+        Serial.printf("Learned ID: 0x%03X\n", id);
+      }
+      return;
+    }
+
+    bool known = false;
+    for (int i = 0; i < idCount; i++) {
+      if (learnedIDs[i] == id) { known = true; break; }
+    }
+    if (!known) {
+      char msg[32];
+      snprintf(msg, sizeof(msg), "Unknown ID 0x%03X", (unsigned int)id);
+      Serial.printf("⚠ %s\n", msg);
+      setAlert(msg);
+      can_score = min(10, can_score + 3);
+    }
+
+    if (has_last_data && known) {
+      for (int i = 0; i < len; i++) {
+        int jump = abs((int)buf[i] - (int)last_data[i]);
+        if (jump > 80) {
+          char msg[32];
+          snprintf(msg, sizeof(msg), "Val Jump 0x%03X +%d",
+                   (unsigned int)id, jump);
+          Serial.printf("⚠ %s\n", msg);
+          setAlert(msg);
+          can_score = min(10, can_score + 3);
+          break;
+        }
+      }
+    }
+    memcpy(last_data, buf, len);
+    has_last_data = true;
+  }
+}
+
+// =============================================
+// NRF24 HANDLER
+// =============================================
+void handleNRF() {
+  int raw_count = 0;
+
+  for (int ch = 0; ch < 125; ch++) {
+    radio.setChannel(ch);
+    radio.startListening();
+    for (int s = 0; s < 3; s++) {
+      delayMicroseconds(300);
+      if (radio.testCarrier()) { raw_count++; break; }
+    }
+    radio.stopListening();
+    if (ch % 25 == 0) yield();
+  }
+
+  radio.startListening();
+
+  nrf_cumulative += raw_count;
+  unsigned long elapsed = millis() - nrf_window_start;
+
+  Serial.printf("NRF24: %d ch | total: %d | elapsed: %lums\n",
+                raw_count, nrf_cumulative, elapsed);
+
+  // Reset window based on time elapsed not fixed 5000ms
+  if (elapsed >= 3000) {                    // ← reduce to 3 seconds
+    Serial.printf("Window reset — total was: %d\n", nrf_cumulative);
+
+    // More aggressive mapping — 5 detections = score 5
+    rf_score_24 = map(nrf_cumulative, 0, 10, 0, 10);
+    rf_score_24 = max(0, min(10, rf_score_24));
+
+    if (nrf_cumulative >= 3) {
+      char msg[32];
+      snprintf(msg, sizeof(msg), "RF 2.4G %d hits", nrf_cumulative);
+      setAlert(msg);
+      Serial.printf("⚠ RF 2.4G: %d hits → score %d\n",
+                    nrf_cumulative, rf_score_24);
+    }
+
+    nrf_cumulative   = 0;                   // ← reset counter
+    nrf_window_start = millis();            // ← reset timer
+  }
+}
+
+// =============================================
+// CC1101 HANDLER
+// =============================================
+void handleCC1101() {
+  rf_score_sub = 0;
+  bool alert_printed = false;
+
+  // Explicitly take SPI control for CC1101
+  SPI.begin(18, 19, 23, CC1101_CS);
+  ELECHOUSE_cc1101.SetRx();        // ← re-enter RX mode before reading
+
+  for (int i = 0; i < NUM_BANDS; i++) {
+    ELECHOUSE_cc1101.setMHZ(cc1101_bands[i]);
+    delay(10);                     // ← increase settle time
+
+    int rssi_sum = 0;
+    for (int j = 0; j < 3; j++) {
+      rssi_sum += ELECHOUSE_cc1101.getRssi();
+      delay(5);
+    }
+    int rssi_avg = rssi_sum / 3;
+
+    Serial.printf("  %.0f MHz → %d dBm\n", cc1101_bands[i], rssi_avg);
+
+    if (rssi_avg > cc1101_noise_floor) {
+      rf_score_sub++;
+      if (!alert_printed) {
+        char msg[32];
+        snprintf(msg, sizeof(msg), "SubGHz %.0fMHz %ddBm",
+                 cc1101_bands[i], rssi_avg);
+        setAlert(msg);
+        alert_printed = true;
+      }
+    }
+  }
+
+  // Hand SPI back with full reinit
+  SPI.end();
+  delay(20);
+  SPI.begin(); 
+  delay(20);
+
+  rf_score_sub = map(rf_score_sub, 0, NUM_BANDS, 0, 10);
+  rf_score_sub = max(0, min(10, rf_score_sub));
+}
+
+// =============================================
+// SERIAL COMMANDS
+// u=unknown ID  f=flood  j=jump
+// r=reset       s=status c=CC1101 debug
+// =============================================
+void handleSerialCommands() {
+  if (!Serial.available()) return;
+  char cmd = Serial.read();
+
+  switch (cmd) {
+    case 'u':
+      if (!learning_mode) {
+        can_score = min(10, can_score + 3);
+        setAlert("TEST: Unknown ID");
+        Serial.println("[TEST] Unknown ID → CAN +3");
+      }
+      break;
+    case 'f':
+      if (!learning_mode) {
+        can_score = min(10, can_score + 4);
+        setAlert("TEST: CAN Flood");
+        Serial.println("[TEST] Flood → CAN +4");
+      }
+      break;
+    case 'j':
+      if (!learning_mode) {
+        can_score = min(10, can_score + 3);
+        setAlert("TEST: Value Jump");
+        Serial.println("[TEST] Value jump → CAN +3");
+      }
+      break;
+    case 'r':
+      can_score = rf_score_24 = rf_score_sub = 0;
+      threat_score = 0;
+      setAlert("Scores reset");
+      Serial.println("All scores reset");
+      break;
+    case 's':
+      last_serial_print = 0;
+      break;
+    case 'c':
+      Serial.println("── CC1101 Raw RSSI ──");
+      for (int i = 0; i < NUM_BANDS; i++) {
+        ELECHOUSE_cc1101.setMHZ(cc1101_bands[i]);
+        delay(10);
+        Serial.printf("  %.0f MHz → %d dBm\n",
+                      cc1101_bands[i], ELECHOUSE_cc1101.getRssi());
+      }
+      Serial.printf("  Threshold : %d dBm\n", cc1101_noise_floor);
+      break;
+  }
+}
+
+// =============================================
+// SCORE DECAY
+// =============================================
+void decayScores() {
+  if (millis() - last_tft_update > 1000) {
+  prev_rf24  = -1;  // force redraw
+  prev_sub   = -1;
+  prev_can   = -1;
+  updateDashboard();
+  last_tft_update = millis();
+}
+}
+
+// =============================================
+// THREAT ENGINE
+// =============================================
+void calculateThreat() {
+  threat_score = (0.4 * rf_score_24)
+               + (0.4 * rf_score_sub)
+               + (0.2 * can_score);
+  threat_score = max(0.0f, min(10.0f, threat_score));
+}
+
+const char* getThreatLevel() {
+  if (threat_score <= 3) return "LOW";
+  if (threat_score <= 6) return "MEDIUM";
+  return "HIGH";
+}
+
+// =============================================
+// SERIAL STATUS PRINT — every 2 seconds
+// =============================================
+void printStatus() {
+  if (millis() - last_serial_print > 2000) {
+    Serial.println("─────────────────────────────");
+    Serial.printf("Mode         : %s\n",
+                  learning_mode ? "LEARNING" : "DETECTION");
+    Serial.printf("RF 2.4G      : %d / 10\n", rf_score_24);
+    Serial.printf("RF SubGHz    : %d / 10\n", rf_score_sub);
+    Serial.printf("CAN Score    : %d / 10\n", can_score);
+    Serial.printf("Threat Score : %.1f / 10\n", threat_score);
+    Serial.printf("Threat Level : %s\n", getThreatLevel());
+    Serial.printf("Last Alert   : %s\n", last_alert);
+    Serial.println("─────────────────────────────\n");
+    last_serial_print = millis();
+  }
+}
